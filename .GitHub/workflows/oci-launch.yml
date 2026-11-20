@@ -16,7 +16,7 @@ concurrency:
 jobs:
   launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 10
     env:
       INSTANCE_NAME: yt-stream
       OCPUS: "1"
@@ -88,7 +88,7 @@ jobs:
           for FD in FAULT-DOMAIN-1 FAULT-DOMAIN-2 FAULT-DOMAIN-3; do
             echo "Trying $FD ..."
             set +e
-            out=$(oci compute instance launch \
+            out=$(oci --no-retry compute instance launch \
               --compartment-id "$T" \
               --availability-domain "$AD" \
               --fault-domain "$FD" \
