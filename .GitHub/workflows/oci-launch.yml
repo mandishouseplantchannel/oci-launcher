@@ -1,0 +1,125 @@
+name: oci-launch
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # GitHub's minimum interval; runs may be delayed
+  workflow_dispatch:         # lets you start it manually from the Actions tab
+
+permissions:
+  actions: write             # needed so the workflow can disable itself on success
+  contents: read
+
+concurrency:
+  group: oci-launch
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      INSTANCE_NAME: yt-stream
+      OCPUS: "1"
+      MEMORY_GB: "6"
+      BOOT_GB: "50"
+      UBUNTU_VERSION: "24.04"
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      GH_TOKEN: ${{ github.token }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+      CLOUD_INIT: ${{ secrets.CLOUD_INIT }}   # optional
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Configure OCI
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          printf '%s\n' "$SSH_PUBLIC_KEY" > ~/.oci/ssh.pub
+          printf '%s\n' "$CLOUD_INIT" > ~/.oci/cloud-init.sh
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/key.pem
+          EOF
+
+      - name: Try to launch instance
+        run: |
+          T="$OCI_TENANCY_OCID"
+
+          # Stop if an instance with this name already exists
+          EXISTING=$(oci compute instance list --compartment-id "$T" \
+            --display-name "$INSTANCE_NAME" \
+            --query 'data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`] | length(@)' \
+            --raw-output 2>/dev/null)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "0" ]; then
+            echo "Instance already exists. Disabling workflow."
+            gh workflow disable oci-launch.yml --repo "$GITHUB_REPOSITORY"
+            exit 0
+          fi
+
+          AD=$(oci iam availability-domain list --query 'data[0].name' --raw-output)
+          IMAGE_ID=$(oci compute image list --compartment-id "$T" \
+            --operating-system "Canonical Ubuntu" \
+            --operating-system-version "$UBUNTU_VERSION" \
+            --shape VM.Standard.A1.Flex \
+            --sort-by TIMECREATED --sort-order DESC --limit 1 \
+            --query 'data[0].id' --raw-output)
+
+          if [ -z "$AD" ] || [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "null" ]; then
+            echo "Could not look up availability domain or Ubuntu aarch64 image."
+            exit 1
+          fi
+
+          # Pass the cloud-init script only if the CLOUD_INIT secret exists
+          UD=()
+          if [ -n "$CLOUD_INIT" ]; then UD=(--user-data-file ~/.oci/cloud-init.sh); fi
+
+          for FD in FAULT-DOMAIN-1 FAULT-DOMAIN-2 FAULT-DOMAIN-3; do
+            echo "Trying $FD ..."
+            set +e
+            out=$(oci compute instance launch \
+              --compartment-id "$T" \
+              --availability-domain "$AD" \
+              --fault-domain "$FD" \
+              --shape VM.Standard.A1.Flex \
+              --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}" \
+              --image-id "$IMAGE_ID" \
+              --subnet-id "$OCI_SUBNET_ID" \
+              --assign-public-ip true \
+              --boot-volume-size-in-gbs "$BOOT_GB" \
+              --ssh-authorized-keys-file ~/.oci/ssh.pub \
+              "${UD[@]}" \
+              --display-name "$INSTANCE_NAME" 2>&1)
+            rc=$?
+            set -e
+
+            if [ $rc -eq 0 ]; then
+              echo "SUCCESS: instance created. Disabling workflow."
+              gh workflow disable oci-launch.yml --repo "$GITHUB_REPOSITORY"
+              exit 0
+            fi
+
+            if grep -qiE "out of host capacity|out of capacity|InternalError" <<<"$out"; then
+              echo "  no capacity"
+            elif grep -qi "TooManyRequests" <<<"$out"; then
+              echo "  rate limited, ending this run"
+              exit 0
+            else
+              echo "  unexpected error:"
+              echo "$out"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "No capacity this round."
