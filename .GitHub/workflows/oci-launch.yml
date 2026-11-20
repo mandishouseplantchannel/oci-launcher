@@ -88,7 +88,7 @@ jobs:
           for FD in FAULT-DOMAIN-1 FAULT-DOMAIN-2 FAULT-DOMAIN-3; do
             echo "Trying $FD ..."
             set +e
-            out=$(oci --no-retry compute instance launch \
+            out=$(timeout 90 oci --no-retry compute instance launch \
               --compartment-id "$T" \
               --availability-domain "$AD" \
               --fault-domain "$FD" \
@@ -110,7 +110,7 @@ jobs:
               exit 0
             fi
 
-            if grep -qiE "out of host capacity|out of capacity|InternalError" <<<"$out"; then
+            if [ $rc -eq 124 ] || grep -qiE "out of host capacity|out of capacity|InternalError" <<<"$out"; then
               echo "  no capacity"
             elif grep -qi "TooManyRequests" <<<"$out"; then
               echo "  rate limited, ending this run"
