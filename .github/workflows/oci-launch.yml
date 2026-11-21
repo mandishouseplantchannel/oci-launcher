@@ -2,12 +2,13 @@ name: oci-launch
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # GitHub's minimum interval; runs may be delayed
+    - cron: '*/30 * * * *'   # each run retries for ~45 min; overlapping runs wait in line
   workflow_dispatch:         # lets you start it manually from the Actions tab
 
 permissions:
-  actions: write             # needed so the workflow can disable itself on success
+  actions: write             # lets the workflow disable itself on success
   contents: read
+  issues: write              # lets the workflow open an issue (which emails you) on success
 
 concurrency:
   group: oci-launch
@@ -16,7 +17,7 @@ concurrency:
 jobs:
   launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 60
     env:
       INSTANCE_NAME: yt-stream
       OCPUS: "1"
@@ -24,6 +25,7 @@ jobs:
       BOOT_GB: "50"
       UBUNTU_VERSION: "24.04"
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      SUPPRESS_LABEL_WARNING: "True"
       GH_TOKEN: ${{ github.token }}
       OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
       OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
@@ -85,41 +87,48 @@ jobs:
           UD=()
           if [ -n "$CLOUD_INIT" ]; then UD=(--user-data-file ~/.oci/cloud-init.sh); fi
 
-          for FD in FAULT-DOMAIN-1 FAULT-DOMAIN-2 FAULT-DOMAIN-3; do
-            echo "Trying $FD ..."
-            set +e
-            out=$(timeout 90 oci --no-retry compute instance launch \
-              --compartment-id "$T" \
-              --availability-domain "$AD" \
-              --fault-domain "$FD" \
-              --shape VM.Standard.A1.Flex \
-              --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}" \
-              --image-id "$IMAGE_ID" \
-              --subnet-id "$OCI_SUBNET_ID" \
-              --assign-public-ip true \
-              --boot-volume-size-in-gbs "$BOOT_GB" \
-              --ssh-authorized-keys-file ~/.oci/ssh.pub \
-              "${UD[@]}" \
-              --display-name "$INSTANCE_NAME" 2>&1)
-            rc=$?
-            set -e
+          # Keep retrying for about 45 minutes per run
+          END=$((SECONDS + 2700))
+          ROUND=0
+          while [ "$SECONDS" -lt "$END" ]; do
+            ROUND=$((ROUND + 1))
+            for FD in FAULT-DOMAIN-1 FAULT-DOMAIN-2 FAULT-DOMAIN-3; do
+              echo "$(date -u +%H:%M:%S) round $ROUND: trying $FD"
+              set +e
+              out=$(timeout 90 oci --no-retry compute instance launch \
+                --compartment-id "$T" \
+                --availability-domain "$AD" \
+                --fault-domain "$FD" \
+                --shape VM.Standard.A1.Flex \
+                --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}" \
+                --image-id "$IMAGE_ID" \
+                --subnet-id "$OCI_SUBNET_ID" \
+                --assign-public-ip true \
+                --boot-volume-size-in-gbs "$BOOT_GB" \
+                --ssh-authorized-keys-file ~/.oci/ssh.pub \
+                "${UD[@]}" \
+                --display-name "$INSTANCE_NAME" 2>&1)
+              rc=$?
+              set -e
 
-            if [ $rc -eq 0 ]; then
-              echo "SUCCESS: instance created. Disabling workflow."
-              gh workflow disable oci-launch.yml --repo "$GITHUB_REPOSITORY"
-              exit 0
-            fi
+              if [ $rc -eq 0 ]; then
+                echo "SUCCESS: instance created. Disabling workflow."
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "Oracle instance created!" --body "The yt-stream instance was created. Open Oracle Cloud, Compute, Instances to find its public IP." || true
+                gh workflow disable oci-launch.yml --repo "$GITHUB_REPOSITORY"
+                exit 0
+              fi
 
-            if [ $rc -eq 124 ] || grep -qiE "out of host capacity|out of capacity|InternalError" <<<"$out"; then
-              echo "  no capacity"
-            elif grep -qi "TooManyRequests" <<<"$out"; then
-              echo "  rate limited, ending this run"
-              exit 0
-            else
-              echo "  unexpected error:"
-              echo "$out"
-              exit 1
-            fi
-            sleep 20
+              if [ $rc -eq 124 ] || grep -qiE "out of host capacity|out of capacity|InternalError" <<<"$out"; then
+                echo "  no capacity"
+              elif grep -qi "TooManyRequests" <<<"$out"; then
+                echo "  rate limited, pausing 2 minutes"
+                sleep 120
+              else
+                echo "  unexpected error:"
+                echo "$out"
+                exit 1
+              fi
+              sleep 20
+            done
           done
-          echo "No capacity this round."
+          echo "Time limit for this run reached. The next scheduled run will continue."
